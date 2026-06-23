@@ -118,11 +118,13 @@ THREE OPT-IN UPGRADES (all default OFF / behavior-preserving):
 """
 import asyncio
 import hashlib
+import http.server
 import json
 import logging
 import os
 import secrets
 import socket
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -409,6 +411,43 @@ _HOME_CODE_FILE = os.getenv("AHA_HOME_CODE_FILE") or (
 )
 print(f"[box] home-code file:    {_HOME_CODE_FILE}")
 
+# Persisted BOOTSTRAP token — the app pushes it to this box over the LAN (see the
+# provisioning endpoint below) at pairing. The agent presents it ONCE on its first
+# /register_box (X-AHA-Provision-Token); the cloud verifies it, enrolls this box's
+# own secret, and burns the token — after which the agent deletes its local copy and
+# authenticates with its secret alone. See SECURITY.md §5b.
+_PROVISION_TOKEN_FILE = os.getenv("AHA_PROVISION_TOKEN_FILE") or (
+    "/data/aha_provision_token" if os.path.isdir("/data") else "/tmp/aha_provision_token"
+)
+# Port for the agent's LAN provisioning HTTP endpoint. host_network is on, so this is
+# reachable from the app on the same Wi-Fi. The app POSTs {home_code, token, creds}.
+PROVISION_PORT = int(os.getenv("AHA_PROVISION_PORT", "8099"))
+print(f"[box] provision-token file: {_PROVISION_TOKEN_FILE}")
+
+
+def _read_provision_token() -> "str | None":
+    try:
+        with open(_PROVISION_TOKEN_FILE) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def _write_provision_token(token: str) -> None:
+    with open(_PROVISION_TOKEN_FILE, "w") as f:
+        f.write(token)
+    try:
+        os.chmod(_PROVISION_TOKEN_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def _clear_provision_token() -> None:
+    try:
+        os.remove(_PROVISION_TOKEN_FILE)
+    except OSError:
+        pass
+
 
 def _persist_home_code(hc: str) -> None:
     """Write the bound home_code locally (best-effort) so the add-on log/diagnostics
@@ -463,7 +502,7 @@ ONVIF_DISCOVERY_TIMEOUT = int(os.getenv("AHA_ONVIF_TIMEOUT", "5"))
 TELEMETRY_INTERVAL = int(os.getenv("AHA_TELEMETRY_INTERVAL", "300"))
 
 # Agent build version — surfaced in telemetry so the fleet's versions are visible.
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.3.0"
 
 # (a) Per-box identity secret. Generated ON THE BOX on first boot and persisted, so
 # the distributed add-on image carries NO fleet-wide secret to extract. Presented on
@@ -1193,15 +1232,24 @@ def register(cameras: list) -> None:
     # Per-box identity: the cloud binds this secret to our device_id on first sight
     # (TOFU) and thereafter requires it, so no one else can register as us.
     headers["X-AHA-Box-Secret"] = BOX_SECRET
+    # BOOTSTRAP token: if the app pushed one to us (we're not yet enrolled), present it
+    # so the cloud lets this first registration through and enrolls our secret. It's
+    # single-use; we delete our copy once the cloud accepts it.
+    token = _read_provision_token()
+    if token:
+        headers["X-AHA-Provision-Token"] = token
     req = urllib.request.Request(
         f"{BACKEND_URL}/register_box", data=body, headers=headers, method="POST",
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
         result = json.loads(resp.read().decode())
     print(f"[box] registered {len(cameras)} camera(s)")
+    if token:
+        # The cloud accepted (no exception) — the token is now consumed/burned, drop
+        # our local copy so we never replay it; our secret is the credential now.
+        _clear_provision_token()
     if result.get("claimed"):
-        # The app already pre-authorized us (or we were claimed earlier): cache the
-        # home_code and clear any stale "add your box" notification.
+        # We're paired: cache the home_code and clear any stale "add your box" notice.
         _persist_home_code(result.get("home_code") or "")
         print("[box] box is claimed and ready.")
         _ha_dismiss()
@@ -1463,29 +1511,19 @@ async def handle_request(payload: dict) -> dict:
         _persist_home_code(hc)
         _mdns_refresh()  # flip the LAN beacon's claimed flag to 1
         return {"ok": True}
-    # (unclaim push) The cloud tells us we've been unpaired. Wipe every trace of
-    # the old home's camera config off this box (creds file + go2rtc streams +
-    # in-memory allowlist), then re-register so the cloud also sees an empty
-    # camera set for this device — finally refresh the HA "claim your box"
-    # notification with the fresh claim_code. No agent restart required.
+    # (unclaim push) The cloud tells us we've been unpaired and has ERASED our
+    # binding + secret server-side. Wipe every trace locally: camera config (creds +
+    # go2rtc streams + allowlist, via _wipe_camera_state which also removes the
+    # home_code file) AND the bootstrap token. We do NOT re-register — we're
+    # de-provisioned, so the cloud would reject it; the box goes mute until the app
+    # PAIRS it again (a fresh token pushed to the LAN endpoint). We refresh the mDNS
+    # beacon to claimed=0 and surface our device_id so the owner can re-add us.
     if payload.get("kind") == "unclaimed":
-        print(f"[box] cloud-unclaimed; wiping local camera state")
+        print(f"[box] cloud-unclaimed; erasing local pairing state")
         await asyncio.to_thread(_wipe_camera_state)
-        # _wipe_camera_state posts /api/restart to go2rtc. Give it a few
-        # seconds to come back before we try discover_cameras — otherwise we
-        # hit a half-restarted go2rtc and spam-retry through the discovery
-        # loop's 10× back-off.
-        await asyncio.sleep(5)
-        # Re-register with whatever go2rtc reports now (should be empty).
-        # register() itself raises the HA "claim your box" notification
-        # because the box is unclaimed at this moment — we don't need a
-        # second _ha_notify call here, that just fires the notification
-        # twice (was a duplicate observed on the test box).
-        try:
-            cams = await asyncio.to_thread(discover_cameras)
-            await asyncio.to_thread(register, cams)
-        except Exception as e:
-            print(f"[box] post-unclaim re-register failed ({e}); next boot will retry")
+        _clear_provision_token()
+        _mdns_refresh()
+        _notify_device_id()
         return {"ok": True}
     # (config-push) The app pushes camera creds at claim time over this same channel.
     if payload.get("kind") == "configure_cameras":
@@ -1634,6 +1672,111 @@ def _mdns_refresh() -> None:
         print(f"[box] mDNS refresh failed ({e}); continuing")
 
 
+# ---------------------------------------------------------------------------
+# LAN provisioning endpoint.
+#
+# The app, on the same Wi-Fi, POSTs the pairing material here:
+#   {home_code, token, onvif_username?, onvif_password?}
+# We persist the bootstrap token (presented on the next /register_box), cache the
+# home_code, apply the camera creds, and (re-)register — synchronously, so the HTTP
+# reply means "provisioned + registered." host_network is on, so binding
+# 0.0.0.0:<PROVISION_PORT> is reachable from the app. The token reaches us here, out
+# of band from the cloud, which is what stops a fake box from bootstrapping.
+# Best-effort: a failure starting/serving this must never stop the agent.
+# ---------------------------------------------------------------------------
+def _provision_status() -> dict:
+    """The public identity the app needs to pair this box."""
+    return {
+        "device_id": DEVICE_ID,
+        "name": BOX_NAME,
+        "agent_version": AGENT_VERSION,
+        "claimed": _is_claimed(),
+    }
+
+
+def _apply_provision(home_code: str, token: str, user: str, pw: str) -> dict:
+    """Persist the pushed pairing material and (re-)register. Blocking — the HTTP
+    handler runs it inline so its reply means the box is registered. The token we
+    just wrote is presented by register() and burned on success."""
+    global ONVIF_USER, ONVIF_PASS
+    _write_provision_token(token)
+    _persist_home_code(home_code)
+    if user:
+        ONVIF_USER, ONVIF_PASS = user, pw
+        _save_persisted_camera_creds({"onvif_username": user, "onvif_password": pw})
+    try:
+        cams, _auth = provision_cameras_and_register()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    _mdns_refresh()
+    return {"ok": True, "device_id": DEVICE_ID, "cameras": len(cams), "claimed": _is_claimed()}
+
+
+class _ProvisionHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        print("[box][provision-http] " + (fmt % args))
+
+    def _send(self, code: int, obj: dict) -> None:
+        payload = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self):
+        if self.path.rstrip("/") in ("", "/provision", "/device_id"):
+            self._send(200, _provision_status())
+        else:
+            self._send(404, {"ok": False, "error": "not found"})
+
+    def do_POST(self):
+        if self.path.rstrip("/") != "/provision":
+            self._send(404, {"ok": False, "error": "not found"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            data = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            self._send(400, {"ok": False, "error": "bad json"})
+            return
+        token = (data.get("token") or "").strip()
+        home_code = (data.get("home_code") or "").strip()
+        if not token or not home_code:
+            self._send(400, {"ok": False, "error": "home_code and token required"})
+            return
+        user = (data.get("onvif_username") or "").strip()
+        pw = data.get("onvif_password") or ""
+        result = _apply_provision(home_code, token, user, pw)
+        self._send(200 if result.get("ok") else 500, result)
+
+
+def _start_provision_server() -> None:
+    """Start the LAN provisioning HTTP server in a daemon thread (best-effort)."""
+    if PROVISION_PORT <= 0:
+        print("[box] LAN provisioning endpoint disabled (AHA_PROVISION_PORT=0)")
+        return
+    try:
+        srv = http.server.ThreadingHTTPServer(("0.0.0.0", PROVISION_PORT), _ProvisionHandler)
+    except OSError as e:
+        print(f"[box] could NOT start LAN provisioning endpoint on :{PROVISION_PORT} ({e})")
+        return
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print(f"[box] LAN provisioning endpoint on http://0.0.0.0:{PROVISION_PORT}/provision")
+
+
+def _ws_connect(url: str):
+    """Open the signaling WebSocket, presenting our per-box secret on the handshake.
+    The cloud's WS auth checks it (under enforcement) and rejects an unpaired/fake box.
+    websockets renamed the header kwarg extra_headers -> additional_headers in v14, so
+    we try both for compatibility."""
+    hdrs = {"X-AHA-Box-Secret": BOX_SECRET}
+    try:
+        return websockets.connect(url, additional_headers=hdrs)
+    except TypeError:
+        return websockets.connect(url, extra_headers=hdrs)
+
+
 async def run() -> None:
     """Boot sequence + the forever signaling loop.
 
@@ -1653,10 +1796,13 @@ async def run() -> None:
         ANY failure (drop, network blip, cloud restart) is caught and we
         reconnect after 3s — the box must self-heal without supervision.
     """
-    # --- Phase 0: LAN discovery beacon + go2rtc bootstrap ---
+    # --- Phase 0: LAN beacon + provisioning endpoint + go2rtc bootstrap ---
     # Advertise this box over mDNS so the app can find it on the LAN (no cloud/
     # public-IP matching). Best-effort; runs in zeroconf's own thread.
     _start_mdns()
+    # Bring up the LAN provisioning endpoint so the app can push {home_code, token}
+    # and bootstrap this box even before it has registered with the cloud.
+    _start_provision_server()
     # Make sure go2rtc exists (auto-install/start if needed) so the customer never
     # has to install it separately — the AHA add-on bootstraps it. Best-effort; off
     # the event loop because it does blocking Supervisor calls + sleeps.
@@ -1687,7 +1833,7 @@ async def run() -> None:
     while True:  # reconnect forever — the box should never stay offline silently
         try:
             print(f"[box] connecting to {url}")
-            async with websockets.connect(url) as ws:
+            async with _ws_connect(url) as ws:
                 print(f"[box] connected — serving {len(cameras)} camera(s) — waiting for requests")
                 # (c) Push telemetry on the same socket (initial + periodic).
                 tele_task = asyncio.create_task(_telemetry_loop(ws))
