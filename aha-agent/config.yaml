@@ -23,7 +23,7 @@
 # =============================================================================
 
 name: AHA Agent
-version: "1.0.0"
+version: "1.0.1"
 slug: aha_agent
 description: AHA box agent — dials out to the AHA cloud and bridges WebRTC signaling to local go2rtc (video stays peer-to-peer)
 
@@ -73,64 +73,36 @@ homeassistant_api: true
 hassio_api: true
 
 # -----------------------------------------------------------------------------
-# Default option values (what the user sees pre-filled in the add-on UI).
-# The keys here MUST match the keys box_client.py reads from /data/options.json.
-#
-# DELIBERATELY MINIMAL:
+# Add-on options — DELIBERATELY MINIMAL. Only TWO keys, and both are OPTIONAL, so
+# Supervisor can never reject the install with a "missing required option" error
+# and the customer never types anything:
 #   * backend_url: the AHA cloud this box dials into. NOT hardcoded — the public
-#     repo ships it EMPTY; the install script writes it at install time (or the
-#     installer/operator sets it in the add-on UI). This is the "non-hardcoded
-#     repository" requirement: no server address baked into the published agent.
-#   * register_key: legacy shared bootstrap key — RETIRED, ships EMPTY. Only set it
-#     if pointing at a cloud that still enforces the old shared-key gate during
-#     transition. The real gates are app-driven provisioning + per-box TOFU.
-#   * NO device_id / user_id: device_id is auto-assigned (host MAC); pairing is set
-#     by the APP, which declares (device_id, home_code) to the cloud (/provision_box).
-#   * NO go2rtc setting: go2rtc is always local at 127.0.0.1:1984 (the standard
-#     add-on port), baked in. The AHA_GO2RTC_PORT env var is an escape hatch for
-#     the rare non-default port; it is not shown in the UI.
+#     repo ships it EMPTY; the install script writes it at install time. (The
+#     "non-hardcoded repository" requirement: no server address baked into the agent.)
+#   * box_name:    friendly label shown in the app. The app can rename a box, so this
+#     is just the initial label; leaving it at "My Box" is fine.
+#
+# EVERYTHING ELSE WAS REMOVED FROM THE CONFIG ON PURPOSE:
+#   * register_key — RETIRED. Pairing is per-box TOFU + an app-minted single-use
+#     bootstrap token; there is no shared key anymore.
+#   * cameras / camera_include / camera_exclude / onvif_username / onvif_password —
+#     camera credentials are PUSHED BY THE APP at pair time (LAN /provision, then
+#     configure_cameras over the cloud socket) and persisted on the box. They were
+#     only ever a config-side backup. box_client.py still honours the matching env
+#     vars (AHA_CAMERAS, AHA_ONVIF_USER/PASS, AHA_CAMERA_INCLUDE/EXCLUDE) as a dev
+#     escape hatch, so nothing is lost — they're just no longer add-on options.
+#   * device_id is auto-assigned (host MAC); go2rtc is always local at 127.0.0.1:1984
+#     (AHA_GO2RTC_PORT env overrides for the rare non-default port).
 # -----------------------------------------------------------------------------
 options:
-  backend_url: ""        # AHA cloud URL, e.g. https://cloud.example.com — set at install
-  register_key: ""       # legacy shared key (leave empty; retired)
-  box_name: "My Box"     # friendly label shown in the app (set per box, e.g. "Reception")
-  # (b) OPTIONAL camera/NVR auto-config — each entry is written into the local go2rtc
-  # as one stream, so onboarding is "enter your NVR login" instead of editing go2rtc
-  # YAML. Leave empty to just serve whatever go2rtc already has. Per entry:
-  #   name (required) + EITHER a full `src` (advanced) OR parts: type (onvif|rtsp),
-  #   host, port, username, password, path.
-  cameras: []
-  # (b) OPTIONAL split — serve only these camera_ids (include) or all-but-these
-  # (exclude), comma-separated. Lets several boxes share ONE go2rtc with disjoint
-  # camera sets. Leave blank to serve all discovered streams.
-  camera_include: ""
-  camera_exclude: ""
-  # (b+) OPTIONAL ONVIF auto-discovery — give SHARED camera credentials and the agent
-  # scans the LAN for ONVIF cameras, resolves each main stream, and auto-numbers them
-  # cam1..camX (no IPs/paths to type). Cameras on different creds can still be added
-  # manually via `cameras` above. Leave blank to disable.
-  onvif_username: ""
-  onvif_password: ""
+  backend_url: ""        # AHA cloud URL — written by the install script at install time
+  box_name: "My Box"     # friendly label shown in the app (optional; the app can rename)
 
 # -----------------------------------------------------------------------------
-# Schema = validation + the UI form HA renders for the options above.
-# Types must line up with how box_client.py uses each value. "str?" = optional.
-# `password` renders masked; the list-of-objects form lets the user add N cameras.
+# Schema = validation for the two options above. Both are OPTIONAL ("str?") on
+# purpose: with no required key, the install-time options call can never fail
+# validation regardless of which keys it sends.
 # -----------------------------------------------------------------------------
 schema:
   backend_url: str?
-  register_key: str?
-  box_name: str
-  cameras:
-    - name: str
-      type: list(onvif|rtsp)?
-      host: str?
-      port: int?
-      username: str?
-      password: password?
-      path: str?
-      src: str?
-  camera_include: str?
-  camera_exclude: str?
-  onvif_username: str?
-  onvif_password: password?
+  box_name: str?
