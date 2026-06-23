@@ -1,0 +1,136 @@
+# =============================================================================
+# AHA Agent — Home Assistant add-on manifest (config.yaml)
+# =============================================================================
+# This file tells Home Assistant Supervisor how to install, configure, and run
+# the AHA box agent (box_client.py) as an add-on.
+#
+# WHAT THE AGENT DOES (the "switchboard / P2P" model):
+#   On boot the agent auto-discovers the cameras in the box's local go2rtc,
+#   registers the box + that camera list with the AHA cloud, then opens an
+#   OUTBOUND WebSocket to the cloud and holds it open. The cloud is only a
+#   switchboard: it relays a viewer's WebRTC *offer* to this box over that
+#   socket and returns the box's *answer*. After that handshake, live video
+#   flows phone <-> box DIRECTLY (P2P, DTLS-SRTP) and NEVER through the cloud.
+#
+# REPURPOSE-TO-ANY-BOX:
+#   This same add-on runs on ANY Home Assistant box with almost nothing for the
+#   customer to type. The box's device id is assigned AUTOMATICALLY (derived from the
+#   host NIC MAC, else machine-id, else a persisted random id); pairing is done by the
+#   APP, which declares (device_id, home_code) to the cloud (/provision_box); the AHA
+#   cloud URL is set ONCE at install time (the `backend_url` option, written by the
+#   install script — NOT hardcoded); and go2rtc is always local at 127.0.0.1:1984
+#   (baked). The agent then auto-discovers whatever cameras the local go2rtc exposes.
+# =============================================================================
+
+name: AHA Agent
+version: "1.0.0"
+slug: aha_agent
+description: AHA box agent — dials out to the AHA cloud and bridges WebRTC signaling to local go2rtc (video stays peer-to-peer)
+
+# Architectures we publish for. arm64/amd64 cover the vast majority of HA boxes
+# (HA Green, Yellow, Pi 4/5 64-bit, generic x86 NUCs); armv7 covers older Pis.
+# These MUST match the platforms produced by build-and-push.sh when you switch
+# to a prebuilt `image:` (see the README "Prebuilt image" section).
+arch:
+  - aarch64
+  - amd64
+  - armv7
+
+# -----------------------------------------------------------------------------
+# Runtime behaviour
+# -----------------------------------------------------------------------------
+# host_network: true  -> the agent shares the host's network namespace so it can
+#   reach the LAN go2rtc (e.g. http://192.168.x.x:1984) and so go2rtc's WebRTC
+#   media ports (UDP/TCP 8555) are reachable for P2P. The agent itself only
+#   makes OUTBOUND connections (to the cloud and to local go2rtc); it opens no
+#   inbound listening port of its own.
+host_network: true
+
+# boot: auto       -> start automatically when Home Assistant boots, so the box
+#   re-registers and reconnects with no human intervention after a power cycle.
+boot: auto
+
+# startup: application -> this is an ordinary long-running app (not a system/
+#   service-tier add-on); start it in the normal application phase.
+startup: application
+
+# init: false -> use the base image's own init/CMD (our Dockerfile's CMD runs
+#   python directly); we don't need HA's legacy s6 init wrapper.
+init: false
+
+# homeassistant_api: true -> Home Assistant hands the add-on a SUPERVISOR_TOKEN so
+#   the agent can call HA's own API. We use it to raise the "claim your box"
+#   notification (persistent_notification.create). Without this grant the agent
+#   still runs; it just falls back to printing the claim code in its log.
+homeassistant_api: true
+
+# hassio_api: true -> lets the agent call the SUPERVISOR API directly
+#   (http://supervisor/...). We use /network/info to read the HOST's primary
+#   NIC MAC for a durable device id that survives add-on reinstalls (the
+#   container machine-id does not). Without this grant the agent falls back to
+#   reading /sys/class/net (works because host_network is on) and then to the
+#   machine-id, so it still functions; the Supervisor path is just the cleanest.
+hassio_api: true
+
+# -----------------------------------------------------------------------------
+# Default option values (what the user sees pre-filled in the add-on UI).
+# The keys here MUST match the keys box_client.py reads from /data/options.json.
+#
+# DELIBERATELY MINIMAL:
+#   * backend_url: the AHA cloud this box dials into. NOT hardcoded — the public
+#     repo ships it EMPTY; the install script writes it at install time (or the
+#     installer/operator sets it in the add-on UI). This is the "non-hardcoded
+#     repository" requirement: no server address baked into the published agent.
+#   * register_key: legacy shared bootstrap key — RETIRED, ships EMPTY. Only set it
+#     if pointing at a cloud that still enforces the old shared-key gate during
+#     transition. The real gates are app-driven provisioning + per-box TOFU.
+#   * NO device_id / user_id: device_id is auto-assigned (host MAC); pairing is set
+#     by the APP, which declares (device_id, home_code) to the cloud (/provision_box).
+#   * NO go2rtc setting: go2rtc is always local at 127.0.0.1:1984 (the standard
+#     add-on port), baked in. The AHA_GO2RTC_PORT env var is an escape hatch for
+#     the rare non-default port; it is not shown in the UI.
+# -----------------------------------------------------------------------------
+options:
+  backend_url: ""        # AHA cloud URL, e.g. https://cloud.example.com — set at install
+  register_key: ""       # legacy shared key (leave empty; retired)
+  box_name: "My Box"     # friendly label shown in the app (set per box, e.g. "Reception")
+  # (b) OPTIONAL camera/NVR auto-config — each entry is written into the local go2rtc
+  # as one stream, so onboarding is "enter your NVR login" instead of editing go2rtc
+  # YAML. Leave empty to just serve whatever go2rtc already has. Per entry:
+  #   name (required) + EITHER a full `src` (advanced) OR parts: type (onvif|rtsp),
+  #   host, port, username, password, path.
+  cameras: []
+  # (b) OPTIONAL split — serve only these camera_ids (include) or all-but-these
+  # (exclude), comma-separated. Lets several boxes share ONE go2rtc with disjoint
+  # camera sets. Leave blank to serve all discovered streams.
+  camera_include: ""
+  camera_exclude: ""
+  # (b+) OPTIONAL ONVIF auto-discovery — give SHARED camera credentials and the agent
+  # scans the LAN for ONVIF cameras, resolves each main stream, and auto-numbers them
+  # cam1..camX (no IPs/paths to type). Cameras on different creds can still be added
+  # manually via `cameras` above. Leave blank to disable.
+  onvif_username: ""
+  onvif_password: ""
+
+# -----------------------------------------------------------------------------
+# Schema = validation + the UI form HA renders for the options above.
+# Types must line up with how box_client.py uses each value. "str?" = optional.
+# `password` renders masked; the list-of-objects form lets the user add N cameras.
+# -----------------------------------------------------------------------------
+schema:
+  backend_url: str?
+  register_key: str?
+  box_name: str
+  cameras:
+    - name: str
+      type: list(onvif|rtsp)?
+      host: str?
+      port: int?
+      username: str?
+      password: password?
+      path: str?
+      src: str?
+  camera_include: str?
+  camera_exclude: str?
+  onvif_username: str?
+  onvif_password: password?

@@ -1,0 +1,11 @@
+# Home Assistant add-on REPOSITORY manifest.
+# This file must sit at the ROOT of the GitHub repo you push so Home Assistant can
+# add it via Settings -> Add-ons -> Add-on Store -> (⋮) -> Repositories, or via the
+# Supervisor API (POST /addons/repositories) that tools/provision-box.sh uses.
+# Each add-on lives in its own subfolder (here: aha-agent/) holding config.yaml +
+# Dockerfile + box_client.py.
+#
+# TODO: set `url` to the actual GitHub URL you push this to.
+name: AHA Add-ons
+url: "https://github.com/titansahil/aha-addons"
+maintainer: Aurus IT
