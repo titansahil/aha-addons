@@ -23,7 +23,7 @@
 # =============================================================================
 
 name: AHA Agent
-version: "1.0.2"
+version: "1.0.3"
 slug: aha_agent
 description: AHA box agent — dials out to the AHA cloud and bridges WebRTC signaling to local go2rtc (video stays peer-to-peer)
 
@@ -41,9 +41,10 @@ arch:
 # -----------------------------------------------------------------------------
 # host_network: true  -> the agent shares the host's network namespace so it can
 #   reach the LAN go2rtc (e.g. http://192.168.x.x:1984) and so go2rtc's WebRTC
-#   media ports (UDP/TCP 8555) are reachable for P2P. The agent itself only
-#   makes OUTBOUND connections (to the cloud and to local go2rtc); it opens no
-#   inbound listening port of its own.
+#   media ports (UDP/TCP 8555) are reachable for P2P. The agent opens exactly ONE
+#   inbound LAN port of its own — AHA_PROVISION_PORT (default 8099), used only at
+#   pair time for the app's provisioning push; every other connection it makes
+#   (to the cloud and to local go2rtc) is OUTBOUND.
 host_network: true
 
 # boot: auto       -> start automatically when Home Assistant boots, so the box

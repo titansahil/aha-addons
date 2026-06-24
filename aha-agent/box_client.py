@@ -122,6 +122,7 @@ import http.server
 import json
 import logging
 import os
+import re
 import secrets
 import socket
 import subprocess
@@ -423,6 +424,7 @@ _PROVISION_TOKEN_FILE = os.getenv("AHA_PROVISION_TOKEN_FILE") or (
 # Port for the agent's LAN provisioning HTTP endpoint. host_network is on, so this is
 # reachable from the app on the same Wi-Fi. The app POSTs {home_code, token, creds}.
 PROVISION_PORT = int(os.getenv("AHA_PROVISION_PORT", "8099"))
+_MAX_PROVISION_BODY = 64 * 1024   # cap the unauthenticated LAN /provision POST body
 print(f"[box] provision-token file: {_PROVISION_TOKEN_FILE}")
 
 
@@ -614,6 +616,7 @@ def _spawn_bundled_go2rtc() -> bool:
             os.makedirs(os.path.dirname(_GO2RTC_CONFIG), exist_ok=True)
             with open(_GO2RTC_CONFIG, "w") as f:
                 f.write('api:\n  listen: ":1984"\nwebrtc:\n  listen: ":8555"\n')
+            os.chmod(_GO2RTC_CONFIG, 0o600)  # holds RTSP URLs with embedded NVR creds
         except Exception as e:
             print(f"[box] could not write {_GO2RTC_CONFIG}: {e} (go2rtc will use defaults)")
     try:
@@ -791,7 +794,6 @@ def _go2rtc_apply_streams(streams: dict) -> int:
             lines.append(f'    - "{safe}"')
         new_block = "\n".join(lines) + "\n"
 
-    import re
     # Same anchored-streams regex as the wipe path — handles `streams:` followed
     # by either multi-line children OR the inline empty-mapping form `{}`.
     # Without the [^\n]* the second pass would never match the wipe's leftover
@@ -917,7 +919,6 @@ def _go2rtc_persist_empty_streams() -> bool:
     # Replace any 'streams:' block (column-0 key + indented children) with an
     # empty mapping. Regex-based instead of pulling in PyYAML — the streams
     # block is structurally trivial.
-    import re
     # Match the streams: line plus any indented children. The `[^\n]*` after
     # `streams:` is critical — it catches the inline `streams: {}` form (which
     # is what we leave behind after a previous wipe). Earlier regex required
@@ -1781,8 +1782,24 @@ class _ProvisionHandler(http.server.BaseHTTPRequestHandler):
         if self.path.rstrip("/") != "/provision":
             self._send(404, {"ok": False, "error": "not found"})
             return
+        # SECURITY: only an UNPAIRED box accepts a LAN provision push. This endpoint is
+        # unauthenticated (same-LAN reach is treated as intent), so once the box is
+        # paired we refuse to let any other device on the Wi-Fi re-point it — overwrite
+        # its home_code/token/ONVIF creds or wipe/replace its go2rtc streams. Re-pairing
+        # must first go through the app's unpair, which clears local state (home_code
+        # file removed) and flips _is_claimed() back to false.
+        if _is_claimed():
+            self._send(403, {"ok": False, "error": "already paired; unpair first"})
+            return
         try:
             length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._send(400, {"ok": False, "error": "bad length"})
+            return
+        if length <= 0 or length > _MAX_PROVISION_BODY:
+            self._send(400, {"ok": False, "error": "missing or oversize body"})
+            return
+        try:
             data = json.loads(self.rfile.read(length) or b"{}")
         except (ValueError, json.JSONDecodeError):
             self._send(400, {"ok": False, "error": "bad json"})
@@ -1791,6 +1808,11 @@ class _ProvisionHandler(http.server.BaseHTTPRequestHandler):
         home_code = (data.get("home_code") or "").strip()
         if not token or not home_code:
             self._send(400, {"ok": False, "error": "home_code and token required"})
+            return
+        # Length caps mirror the cloud's (ProvisionBoxRequest: token 16..256,
+        # home_code <=128) so a LAN caller can't persist absurd values on the box.
+        if not (16 <= len(token) <= 256) or len(home_code) > 128:
+            self._send(400, {"ok": False, "error": "field length out of range"})
             return
         user = (data.get("onvif_username") or "").strip()
         pw = data.get("onvif_password") or ""
