@@ -124,6 +124,7 @@ import logging
 import os
 import secrets
 import socket
+import subprocess
 import threading
 import time
 import urllib.error
@@ -590,6 +591,47 @@ def _go2rtc_reachable() -> bool:
         return False
 
 
+# go2rtc binary BUNDLED into this image by the Dockerfile (preferred source). A
+# fresh HA store has NO go2rtc add-on to install, so relying on a separate add-on
+# leaves the box with zero cameras — we ship our own and run it ourselves.
+_BUNDLED_GO2RTC = "/usr/local/bin/go2rtc"
+_GO2RTC_CONFIG = "/data/go2rtc.yaml"   # persisted add-on data dir; survives restarts
+_go2rtc_proc = None
+
+
+def _spawn_bundled_go2rtc() -> bool:
+    """Launch the go2rtc binary bundled in THIS image on :1984. Returns True once it
+    answers its API. No-op (False) if the binary isn't present (e.g. standalone dev)."""
+    global _go2rtc_proc
+    if not os.path.exists(_BUNDLED_GO2RTC):
+        return False
+    if _go2rtc_proc and _go2rtc_proc.poll() is None:
+        return _go2rtc_reachable()   # already running
+    # Minimal config so go2rtc has stable API + WebRTC listeners. The agent writes
+    # camera streams into THIS SAME file via POST /api/config, so they persist here.
+    if not os.path.exists(_GO2RTC_CONFIG):
+        try:
+            os.makedirs(os.path.dirname(_GO2RTC_CONFIG), exist_ok=True)
+            with open(_GO2RTC_CONFIG, "w") as f:
+                f.write('api:\n  listen: ":1984"\nwebrtc:\n  listen: ":8555"\n')
+        except Exception as e:
+            print(f"[box] could not write {_GO2RTC_CONFIG}: {e} (go2rtc will use defaults)")
+    try:
+        # Inherit stdout/stderr so go2rtc's logs land in the HA add-on Log tab too.
+        _go2rtc_proc = subprocess.Popen([_BUNDLED_GO2RTC, "-config", _GO2RTC_CONFIG])
+    except Exception as e:
+        print(f"[box] failed to launch bundled go2rtc: {e}")
+        return False
+    print(f"[box] launched bundled go2rtc (pid {_go2rtc_proc.pid}) on :1984")
+    for _ in range(15):
+        if _go2rtc_reachable():
+            print("[box] bundled go2rtc is up")
+            return True
+        time.sleep(2)
+    print("[box] bundled go2rtc did not answer on :1984 in time — continuing")
+    return False
+
+
 def _find_go2rtc_slug(listing_key: str) -> str | None:
     """Find a go2rtc add-on slug in a Supervisor listing ('addons' = installed,
     'store' = available). Matches by slug or name containing 'go2rtc'."""
@@ -606,22 +648,27 @@ def _find_go2rtc_slug(listing_key: str) -> str | None:
 
 
 def ensure_go2rtc() -> None:
-    """Make sure a local go2rtc is installed, started, and reachable.
+    """Make sure a local go2rtc is running and reachable.
 
     Flow (all best-effort, never fatal):
-      1. Already reachable?            -> done.
-      2. Installed but not started?    -> start it, wait for reachable.
-      3. Not installed but in store?   -> install, start, wait.
-      4. Can't find it?                -> log a clear message; the box will just
-                                          serve zero cameras until go2rtc exists.
+      0. Already reachable?            -> done.
+      1. go2rtc bundled in this image? -> run it ourselves on :1984 (the normal case;
+                                          a fresh HA store has NO go2rtc add-on).
+      2. Installed add-on present?     -> start it, wait for reachable.
+      3. In the store?                 -> install, start, wait.
+      4. None of the above?            -> log clearly; the box serves zero cameras
+                                          until a go2rtc exists.
 
-    Slug is DETECTED (not hardcoded) so this works regardless of which go2rtc
-    add-on the customer's HA store offers."""
+    Bundling (step 1) is why the customer never has to install go2rtc separately;
+    steps 2-3 stay as a fallback for boxes that already run a go2rtc add-on."""
     if _go2rtc_reachable():
         return
+    # Preferred: the go2rtc we ship inside this image. No store/add-on dependency.
+    if _spawn_bundled_go2rtc():
+        return
     if not os.getenv("SUPERVISOR_TOKEN"):
-        print("[box] go2rtc not reachable and no Supervisor token (standalone?); "
-              "skipping auto-install — start go2rtc manually")
+        print("[box] go2rtc not reachable, no bundled binary, and no Supervisor token "
+              "(standalone?); start go2rtc manually")
         return
 
     print("[box] go2rtc not reachable — attempting auto-install/start")

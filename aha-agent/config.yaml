@@ -23,7 +23,7 @@
 # =============================================================================
 
 name: AHA Agent
-version: "1.0.1"
+version: "1.0.2"
 slug: aha_agent
 description: AHA box agent — dials out to the AHA cloud and bridges WebRTC signaling to local go2rtc (video stays peer-to-peer)
 
