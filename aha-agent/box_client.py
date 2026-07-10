@@ -117,6 +117,7 @@ THREE OPT-IN UPGRADES (all default OFF / behavior-preserving):
       that binds this device_id so it can't be hijacked.
 """
 import asyncio
+import difflib
 import hashlib
 import http.server
 import json
@@ -505,7 +506,7 @@ ONVIF_DISCOVERY_TIMEOUT = int(os.getenv("AHA_ONVIF_TIMEOUT", "5"))
 TELEMETRY_INTERVAL = int(os.getenv("AHA_TELEMETRY_INTERVAL", "300"))
 
 # Agent build version — surfaced in telemetry so the fleet's versions are visible.
-AGENT_VERSION = "1.3.0"
+AGENT_VERSION = "2.0.1"
 
 # (a) Per-box identity secret. Generated ON THE BOX on first boot and persisted, so
 # the distributed add-on image carries NO fleet-wide secret to extract. Presented on
@@ -1236,6 +1237,162 @@ def gather_telemetry() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Voice (V2) — a tiered voice router that runs ON THE BOX.
+#
+#   Tier 1 (fuzzy, ~1ms): match the spoken device name to a known HA light and
+#           call the service API DIRECTLY via the add-on's SUPERVISOR_TOKEN.
+#   Tier 2 (LLM, seconds): only when the fuzzy match is not confident, hand the
+#           raw text to HA's conversation agent (which may be an LLM).
+#
+# Reachable two ways, BOTH landing in _handle_voice_sync():
+#   - LAN (same Wi-Fi): POST /voice on the provisioning HTTP server (fast, no cloud)
+#   - Remote:           cloud relays {kind:"voice"} down the standing WS
+#
+# SECURITY (mirrors the camera SSRF discipline): we only ever act on light.*
+# entities the box itself read from HA — never execute an arbitrary domain.service
+# from relayed text. Tier 1 can only PICK a discovered entity, never define one.
+# ---------------------------------------------------------------------------
+VOICE_CONFIDENCE = float(os.getenv("AHA_VOICE_CONFIDENCE", "0.6"))
+# Optional HA conversation agent for the Tier-2 fallback (e.g. an Ollama agent id).
+# Empty -> HA's default agent. Set via add-on option / env for typo-tolerant fallback.
+VOICE_AGENT = os.getenv("AHA_VOICE_AGENT", "").strip()
+_VOICE_WORD_NUM = {"zero": 0, "five": 5, "ten": 10, "fifteen": 15, "twenty": 20,
+                   "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70,
+                   "eighty": 80, "ninety": 90, "hundred": 100, "half": 50, "full": 100,
+                   "max": 100, "bright": 100, "low": 20, "dim": 25}
+_VOICE_STOP = {"turn", "trun", "trn", "switch", "set", "put", "the", "teh", "to", "at",
+               "on", "off", "please", "a", "light", "lights", "dim", "make", "it",
+               "percent", "brightness", "change", "of"}
+
+
+def _ha_post(path: str, body: dict, base: str = "http://supervisor/core/api"):
+    """POST to the HA Core API with the add-on's SUPERVISOR_TOKEN. Best-effort:
+    returns (status_code, parsed_json_or_None). Never raises. Mirrors _ha_get."""
+    if not SUPERVISOR_TOKEN:
+        return (0, None)
+    try:
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(
+            f"{base}{path}", data=data, method="POST",
+            headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}",
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read().decode()
+            return (r.status, json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as e:
+        return (e.code, None)
+    except Exception as e:
+        return (0, {"_error": str(e)})
+
+
+def _read_home_code() -> str:
+    """The home_code this box is bound to (empty if unpaired)."""
+    try:
+        with open(_HOME_CODE_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _voice_parse(text: str):
+    """Extract (action, brightness, target-phrase) from raw (possibly mis-heard) speech.
+    action ∈ {on, off, brightness}; brightness is 0..100 or None."""
+    t = text.lower().strip()
+    brightness = None
+    m = re.search(r"\b(\d{1,3})\b", t)
+    if m:
+        brightness = min(100, int(m.group(1)))
+    for w, v in _VOICE_WORD_NUM.items():
+        if re.search(rf"\b{w}\b", t):
+            brightness = v
+    if brightness is not None:
+        action = "brightness"
+    elif re.search(r"\boff\b|shut|kill", t):
+        action = "off"
+    else:
+        action = "on"
+    # Drop stop-words AND bare numbers (the number is already captured as brightness),
+    # so "lights 50 percent" -> target "" (generic → all lights), while "led strip 50"
+    # -> target "led strip" (a specific device).
+    target = " ".join(w for w in re.sub(r"[^a-z0-9 ]", " ", t).split()
+                      if w not in _VOICE_STOP and not w.isdigit())
+    return action, brightness, target
+
+
+def _voice_light_names():
+    """Map lowercased light friendly-name -> entity_id, for AVAILABLE lights only.
+    NOTE (V2): uses friendly_names from /states. Registry aliases (WS-only) are not
+    read here; alias-only phrasings fall through to the Tier-2 conversation agent."""
+    states = _ha_get("/states")
+    name_map = {}
+    if isinstance(states, list):
+        for s in states:
+            eid = s.get("entity_id", "")
+            if not eid.startswith("light.") or s.get("state") == "unavailable":
+                continue
+            fn = (s.get("attributes") or {}).get("friendly_name")
+            if fn:
+                name_map[fn.lower()] = eid
+    return name_map
+
+
+def _handle_voice_sync(payload: dict) -> dict:
+    """The shared voice brain. Blocking (urllib + difflib); the cloud path calls it
+    via asyncio.to_thread, the LAN path calls it directly on its handler thread."""
+    text = (payload.get("text") or "").strip()
+    if not text:
+        return {"ok": False, "error": "empty text"}
+    action, brightness, target = _voice_parse(text)
+    names = _voice_light_names()
+    all_entities = sorted(set(names.values()))
+
+    # ---- TIER 1a: GLOBAL command -> act on EVERY available light ----
+    # "turn off the lights", "lights 50%", "all lights off", "everything on" all leave
+    # target empty or an all-word. Act on the whole set, not a single fuzzy match.
+    is_global = (not target) or target in ("all", "everything", "every") \
+        or any(w in ("all", "everything", "every") for w in target.split())
+    if is_global and all_entities:
+        if action == "off":
+            status, _ = _ha_post("/services/light/turn_off", {"entity_id": all_entities})
+            speech = f"Turned off {len(all_entities)} lights."
+        else:
+            body = {"entity_id": all_entities}
+            if brightness is not None:
+                body["brightness_pct"] = brightness
+            status, _ = _ha_post("/services/light/turn_on", body)
+            speech = (f"Set {len(all_entities)} lights to {brightness} percent."
+                      if brightness is not None else f"Turned on {len(all_entities)} lights.")
+        return {"ok": 200 <= status < 300, "tier": "fast", "count": len(all_entities),
+                "entities": all_entities, "action": action, "brightness": brightness, "speech": speech}
+
+    match = difflib.get_close_matches(target, list(names), n=1, cutoff=VOICE_CONFIDENCE)
+    if match:  # ---- TIER 1b: fuzzy hit on a specific device -> direct service call ----
+        entity = names[match[0]]
+        if action == "off":
+            status, _ = _ha_post("/services/light/turn_off", {"entity_id": entity})
+            speech = "Turned it off."
+        else:
+            body = {"entity_id": entity}
+            if brightness is not None:
+                body["brightness_pct"] = brightness
+            status, _ = _ha_post("/services/light/turn_on", body)
+            speech = f"Set to {brightness} percent." if brightness is not None else "Turned it on."
+        ok = 200 <= status < 300
+        return {"ok": ok, "tier": "fast", "entity": entity, "matched": match[0],
+                "action": action, "brightness": brightness, "speech": speech}
+    # ---- TIER 2: hand raw text to HA's conversation agent ----
+    body = {"text": text, "language": "en"}
+    if VOICE_AGENT:
+        body["agent_id"] = VOICE_AGENT
+    status, resp = _ha_post("/conversation/process", body)
+    speech = ((((resp or {}).get("response") or {}).get("speech") or {})
+              .get("plain", {}).get("speech", ""))
+    rtype = (((resp or {}).get("response") or {}).get("response_type"))
+    return {"ok": 200 <= status < 300 and rtype != "error", "tier": "llm",
+            "speech": speech, "response_type": rtype}
+
+
 def _notify_device_id() -> None:
     """Surface this box's device_id so the owner can add it in the app.
 
@@ -1585,6 +1742,10 @@ async def handle_request(payload: dict) -> dict:
     # SAME request/reply channel used for signaling, distinguished by payload.kind.
     if payload.get("kind") == "telemetry":
         return await asyncio.to_thread(gather_telemetry)
+    # (voice, V2) Remote path: the cloud relays a spoken command down the WS. Runs the
+    # tiered router off the event loop so a slow LLM fallback can't stall the reader.
+    if payload.get("kind") == "voice":
+        return await asyncio.to_thread(_handle_voice_sync, payload)
     sdp = payload.get("sdp")
     # Accept either key; viewers send camera_id, older callers may send src.
     cam_id = payload.get("camera_id") or payload.get("src")
@@ -1778,7 +1939,32 @@ class _ProvisionHandler(http.server.BaseHTTPRequestHandler):
         else:
             self._send(404, {"ok": False, "error": "not found"})
 
+    def _voice(self):
+        """LAN voice endpoint (V2): the app POSTs {home_code, text} while on the same
+        Wi-Fi, bypassing the cloud entirely. AUTH: the posted home_code must equal the
+        one this box is bound to — so only the paired app can drive it, not any device
+        on the network. Runs the SAME _handle_voice_sync() the cloud path uses."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return self._send(400, {"ok": False, "error": "bad length"})
+        if length <= 0 or length > _MAX_PROVISION_BODY:
+            return self._send(400, {"ok": False, "error": "missing or oversize body"})
+        try:
+            data = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            return self._send(400, {"ok": False, "error": "bad json"})
+        bound = _read_home_code()
+        if not bound:
+            return self._send(403, {"ok": False, "error": "box not paired"})
+        if (data.get("home_code") or "").strip() != bound:
+            return self._send(403, {"ok": False, "error": "home_code mismatch"})
+        result = _handle_voice_sync({"text": data.get("text") or ""})
+        self._send(200 if result.get("ok") else 502, result)
+
     def do_POST(self):
+        if self.path.rstrip("/") == "/voice":
+            return self._voice()
         if self.path.rstrip("/") != "/provision":
             self._send(404, {"ok": False, "error": "not found"})
             return
