@@ -506,7 +506,7 @@ ONVIF_DISCOVERY_TIMEOUT = int(os.getenv("AHA_ONVIF_TIMEOUT", "5"))
 TELEMETRY_INTERVAL = int(os.getenv("AHA_TELEMETRY_INTERVAL", "300"))
 
 # Agent build version — surfaced in telemetry so the fleet's versions are visible.
-AGENT_VERSION = "2.0.2"
+AGENT_VERSION = "2.0.3"
 
 # (a) Per-box identity secret. Generated ON THE BOX on first boot and persisted, so
 # the distributed add-on image carries NO fleet-wide secret to extract. Presented on
@@ -1265,6 +1265,36 @@ _VOICE_STOP = {"turn", "trun", "trn", "switch", "set", "put", "the", "teh", "to"
                "on", "off", "please", "a", "light", "lights", "dim", "make", "it",
                "percent", "brightness", "change", "of"}
 
+# --- Color-temperature / colour / scene vocabulary (V2.0.3) ------------------
+# Color-temperature words -> Kelvin (lower = warmer). HA clamps to each light's range.
+_VOICE_CTEMP = {
+    "candle": 2200, "candlelight": 2200, "amber": 2200, "very warm": 2300,
+    "warm": 2700, "warm white": 2700, "soft": 2700, "soft white": 2700, "warmer": 2500,
+    "neutral": 4000, "neutral white": 4000, "normal": 4000,
+    "cool": 5200, "cool white": 5200, "cooler": 5200, "bright white": 5200,
+    "cold": 6500, "daylight": 6500, "crisp": 6500,
+}
+# Scene / mood / time-of-day -> (Kelvin | None, brightness_pct | None). Both are applied.
+_VOICE_SCENES = {
+    "evening": (2700, 40), "night": (2200, 12), "night time": (2200, 12), "bedtime": (2200, 10),
+    "sleep": (2200, 6), "nap": (2200, 8), "morning": (5000, 85), "wake up": (5200, 95),
+    "day": (4500, 100), "day time": (4500, 100), "reading": (5000, 100), "read": (5000, 100),
+    "study": (5000, 100), "work": (5000, 100), "focus": (5000, 100), "concentrate": (5000, 100),
+    "relax": (2700, 30), "chill": (2700, 30), "cozy": (2400, 30), "cosy": (2400, 30),
+    "movie": (2500, 15), "cinema": (2500, 15), "dinner": (2400, 45), "romantic": (2200, 25),
+    "party": (4000, 100), "sunset": (2300, 35), "sunrise": (4500, 70),
+}
+# Named colours -> HA color_name (CSS3). Only applied to RGB-capable lights.
+_VOICE_COLORS = {"red", "green", "blue", "yellow", "orange", "purple", "pink", "white",
+    "cyan", "magenta", "violet", "turquoise", "gold", "teal", "lime", "indigo",
+    "maroon", "navy", "olive", "coral", "crimson", "aqua", "lavender"}
+# Every word used above — stripped from the device-name target so "bedroom evening mode"
+# -> target "bedroom".
+_VOICE_VOCAB = set(_VOICE_COLORS) | {"mode", "temperature", "colour", "color", "scene", "white"}
+for _p in list(_VOICE_CTEMP) + list(_VOICE_SCENES):
+    _VOICE_VOCAB.update(_p.split())
+_RGB_MODES = ("rgb", "rgbw", "rgbww", "hs", "xy")
+
 
 def _ha_post(path: str, body: dict, base: str = "http://supervisor/core/api"):
     """POST to the HA Core API with the add-on's SUPERVISOR_TOKEN. Best-effort:
@@ -1296,8 +1326,9 @@ def _read_home_code() -> str:
 
 
 def _voice_parse(text: str):
-    """Extract (action, brightness, target-phrase) from raw (possibly mis-heard) speech.
-    action ∈ {on, off, brightness}; brightness is 0..100 or None."""
+    """Extract (action, brightness, target, color_temp_kelvin, color_name) from raw
+    (possibly mis-heard) speech. action ∈ {on, off}. A scene/mood word fills in default
+    warmth + brightness ("evening" -> warm & dim); explicit words override the defaults."""
     t = text.lower().strip()
     brightness = None
     m = re.search(r"\b(\d{1,3})\b", t)
@@ -1306,81 +1337,133 @@ def _voice_parse(text: str):
     for w, v in _VOICE_WORD_NUM.items():
         if re.search(rf"\b{w}\b", t):
             brightness = v
-    if brightness is not None:
-        action = "brightness"
-    elif re.search(r"\boff\b|shut|kill", t):
+    # scene / mood -> default color-temp + brightness (longest phrase wins)
+    color_temp = None
+    scene = None
+    for phrase in sorted(_VOICE_SCENES, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(phrase)}\b", t):
+            k, b = _VOICE_SCENES[phrase]
+            color_temp, scene = k, phrase
+            if brightness is None and b is not None:
+                brightness = b
+            break
+    # explicit color-temperature word overrides the scene's temp
+    for w in sorted(_VOICE_CTEMP, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(w)}\b", t):
+            color_temp = _VOICE_CTEMP[w]
+            break
+    # named colour (RGB lights)
+    color_name = None
+    for c in _VOICE_COLORS:
+        if re.search(rf"\b{c}\b", t):
+            color_name = c
+            break
+    # off only when clearly negative AND nothing positive was asked for
+    positive = bool(scene) or color_temp is not None or color_name is not None or (brightness or 0) > 0
+    if brightness == 0 or (re.search(r"\boff\b|shut|kill", t) and not positive):
         action = "off"
     else:
         action = "on"
-    # Drop stop-words AND bare numbers (the number is already captured as brightness),
-    # so "lights 50 percent" -> target "" (generic → all lights), while "led strip 50"
-    # -> target "led strip" (a specific device).
+    # target = leftover device words (strip stop-words + numbers only). Vocabulary words
+    # (colours/temps/scenes) are KEPT here — a light may be named "Two Way Color Light";
+    # _handle_voice_sync drops the vocab words that aren't part of a real light name.
     target = " ".join(w for w in re.sub(r"[^a-z0-9 ]", " ", t).split()
                       if w not in _VOICE_STOP and not w.isdigit())
-    return action, brightness, target
+    return action, brightness, target, color_temp, color_name
 
 
-def _voice_light_names():
-    """Map lowercased light friendly-name -> entity_id, for AVAILABLE lights only.
-    NOTE (V2): uses friendly_names from /states. Registry aliases (WS-only) are not
-    read here; alias-only phrasings fall through to the Tier-2 conversation agent."""
+def _voice_lights():
+    """Map lowercased light friendly-name -> (entity_id, supported_color_modes) for
+    AVAILABLE lights only. Capability decides which params we may send (color_temp to a
+    brightness-only light is a 500)."""
     states = _ha_get("/states")
-    name_map = {}
+    out = {}
     if isinstance(states, list):
         for s in states:
             eid = s.get("entity_id", "")
             if not eid.startswith("light.") or s.get("state") == "unavailable":
                 continue
-            fn = (s.get("attributes") or {}).get("friendly_name")
+            attrs = s.get("attributes") or {}
+            fn = attrs.get("friendly_name")
             if fn:
-                name_map[fn.lower()] = eid
-    return name_map
+                out[fn.lower()] = (eid, attrs.get("supported_color_modes") or [])
+    return out
+
+
+def _voice_apply(entities_modes, action, brightness, color_temp, color_name):
+    """Apply the command to a list of (entity_id, modes), sending EACH light only the
+    params it supports (color_temp / color never hit a light that can't do them -> no
+    500). Batches identical param-sets into one call. Returns (ok, count)."""
+    if action == "off" or brightness == 0:   # 0% means OFF, not "on at zero"
+        ids = [e for e, _ in entities_modes]
+        st, _ = _ha_post("/services/light/turn_off", {"entity_id": ids})
+        return (200 <= st < 300, len(ids))
+    groups = {}
+    for eid, modes in entities_modes:
+        p = {}
+        if brightness is not None and brightness > 0:
+            p["brightness_pct"] = brightness
+        if color_name and any(m in modes for m in _RGB_MODES):
+            p["color_name"] = color_name
+        elif color_temp is not None and ("color_temp" in modes or any(m in modes for m in _RGB_MODES)):
+            p["color_temp_kelvin"] = color_temp
+        key = json.dumps(p, sort_keys=True)
+        groups.setdefault(key, (p, []))[1].append(eid)
+    oks = []
+    for _, (p, ids) in groups.items():
+        st, _ = _ha_post("/services/light/turn_on", {"entity_id": ids, **p})
+        oks.append(200 <= st < 300)
+    return (all(oks) if oks else False, len(entities_modes))
+
+
+def _voice_say(action, count, brightness, color_temp, color_name, one=False):
+    who = "it" if one else f"{count} lights"
+    if action == "off":
+        return f"Turned {who} off."
+    bits = []
+    if color_name:
+        bits.append(color_name)
+    elif color_temp is not None:
+        bits.append("warm" if color_temp <= 3000 else ("cool" if color_temp >= 5000 else "neutral white"))
+    if brightness is not None:
+        bits.append(f"{brightness} percent")
+    return f"Set {who} to {' and '.join(bits)}." if bits else f"Turned {who} on."
 
 
 def _handle_voice_sync(payload: dict) -> dict:
-    """The shared voice brain. Blocking (urllib + difflib); the cloud path calls it
-    via asyncio.to_thread, the LAN path calls it directly on its handler thread."""
+    """The shared voice brain. Blocking; the cloud path calls it via asyncio.to_thread,
+    the LAN path calls it on its handler thread."""
     text = (payload.get("text") or "").strip()
     if not text:
         return {"ok": False, "error": "empty text"}
-    action, brightness, target = _voice_parse(text)
-    names = _voice_light_names()
-    all_entities = sorted(set(names.values()))
+    action, brightness, target, color_temp, color_name = _voice_parse(text)
+    lights = _voice_lights()                      # {name: (eid, modes)}
+    all_lm = list(lights.values())
+
+    # Refine the target: drop vocabulary words (colours/temps/scenes) UNLESS they are
+    # part of a real light name (e.g. "Two Way Color Light" legitimately contains "color").
+    name_words = set()
+    for nm in lights:
+        name_words.update(nm.split())
+    target = " ".join(w for w in target.split() if w in name_words or w not in _VOICE_VOCAB)
 
     # ---- TIER 1a: GLOBAL command -> act on EVERY available light ----
-    # "turn off the lights", "lights 50%", "all lights off", "everything on" all leave
-    # target empty or an all-word. Act on the whole set, not a single fuzzy match.
     is_global = (not target) or target in ("all", "everything", "every") \
         or any(w in ("all", "everything", "every") for w in target.split())
-    if is_global and all_entities:
-        if action == "off" or brightness == 0:   # 0% means OFF, not "on at zero"
-            status, _ = _ha_post("/services/light/turn_off", {"entity_id": all_entities})
-            speech = f"Turned off {len(all_entities)} lights."
-        else:
-            body = {"entity_id": all_entities}
-            if brightness is not None:
-                body["brightness_pct"] = brightness
-            status, _ = _ha_post("/services/light/turn_on", body)
-            speech = (f"Set {len(all_entities)} lights to {brightness} percent."
-                      if brightness is not None else f"Turned on {len(all_entities)} lights.")
-        return {"ok": 200 <= status < 300, "tier": "fast", "count": len(all_entities),
-                "entities": all_entities, "action": action, "brightness": brightness, "speech": speech}
+    if is_global and all_lm:
+        ok, n = _voice_apply(all_lm, action, brightness, color_temp, color_name)
+        return {"ok": ok, "tier": "fast", "count": n, "action": action, "brightness": brightness,
+                "color_temp": color_temp, "color": color_name,
+                "speech": _voice_say(action, n, brightness, color_temp, color_name)}
 
-    match = difflib.get_close_matches(target, list(names), n=1, cutoff=VOICE_CONFIDENCE)
-    if match:  # ---- TIER 1b: fuzzy hit on a specific device -> direct service call ----
-        entity = names[match[0]]
-        if action == "off" or brightness == 0:   # 0% means OFF, not "on at zero"
-            status, _ = _ha_post("/services/light/turn_off", {"entity_id": entity})
-            speech = "Turned it off."
-        else:
-            body = {"entity_id": entity}
-            if brightness is not None:
-                body["brightness_pct"] = brightness
-            status, _ = _ha_post("/services/light/turn_on", body)
-            speech = f"Set to {brightness} percent." if brightness is not None else "Turned it on."
-        ok = 200 <= status < 300
-        return {"ok": ok, "tier": "fast", "entity": entity, "matched": match[0],
-                "action": action, "brightness": brightness, "speech": speech}
+    # ---- TIER 1b: fuzzy hit on a specific device ----
+    match = difflib.get_close_matches(target, list(lights), n=1, cutoff=VOICE_CONFIDENCE)
+    if match:
+        eid, modes = lights[match[0]]
+        ok, _ = _voice_apply([(eid, modes)], action, brightness, color_temp, color_name)
+        return {"ok": ok, "tier": "fast", "entity": eid, "matched": match[0], "action": action,
+                "brightness": brightness, "color_temp": color_temp, "color": color_name,
+                "speech": _voice_say(action, 1, brightness, color_temp, color_name, one=True)}
     # ---- TIER 2: hand raw text to HA's conversation agent ----
     body = {"text": text, "language": "en"}
     if VOICE_AGENT:
