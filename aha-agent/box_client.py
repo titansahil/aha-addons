@@ -506,7 +506,7 @@ ONVIF_DISCOVERY_TIMEOUT = int(os.getenv("AHA_ONVIF_TIMEOUT", "5"))
 TELEMETRY_INTERVAL = int(os.getenv("AHA_TELEMETRY_INTERVAL", "300"))
 
 # Agent build version — surfaced in telemetry so the fleet's versions are visible.
-AGENT_VERSION = "2.0.1"
+AGENT_VERSION = "2.0.2"
 
 # (a) Per-box identity secret. Generated ON THE BOX on first boot and persisted, so
 # the distributed add-on image carries NO fleet-wide secret to extract. Presented on
@@ -1353,7 +1353,7 @@ def _handle_voice_sync(payload: dict) -> dict:
     is_global = (not target) or target in ("all", "everything", "every") \
         or any(w in ("all", "everything", "every") for w in target.split())
     if is_global and all_entities:
-        if action == "off":
+        if action == "off" or brightness == 0:   # 0% means OFF, not "on at zero"
             status, _ = _ha_post("/services/light/turn_off", {"entity_id": all_entities})
             speech = f"Turned off {len(all_entities)} lights."
         else:
@@ -1369,7 +1369,7 @@ def _handle_voice_sync(payload: dict) -> dict:
     match = difflib.get_close_matches(target, list(names), n=1, cutoff=VOICE_CONFIDENCE)
     if match:  # ---- TIER 1b: fuzzy hit on a specific device -> direct service call ----
         entity = names[match[0]]
-        if action == "off":
+        if action == "off" or brightness == 0:   # 0% means OFF, not "on at zero"
             status, _ = _ha_post("/services/light/turn_off", {"entity_id": entity})
             speech = "Turned it off."
         else:
