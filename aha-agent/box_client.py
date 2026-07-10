@@ -506,7 +506,7 @@ ONVIF_DISCOVERY_TIMEOUT = int(os.getenv("AHA_ONVIF_TIMEOUT", "5"))
 TELEMETRY_INTERVAL = int(os.getenv("AHA_TELEMETRY_INTERVAL", "300"))
 
 # Agent build version — surfaced in telemetry so the fleet's versions are visible.
-AGENT_VERSION = "2.0.0"
+AGENT_VERSION = "2.0.1"
 
 # (a) Per-box identity secret. Generated ON THE BOX on first boot and persisted, so
 # the distributed add-on image carries NO fleet-wide secret to extract. Presented on
@@ -1312,7 +1312,11 @@ def _voice_parse(text: str):
         action = "off"
     else:
         action = "on"
-    target = " ".join(w for w in re.sub(r"[^a-z0-9 ]", " ", t).split() if w not in _VOICE_STOP)
+    # Drop stop-words AND bare numbers (the number is already captured as brightness),
+    # so "lights 50 percent" -> target "" (generic → all lights), while "led strip 50"
+    # -> target "led strip" (a specific device).
+    target = " ".join(w for w in re.sub(r"[^a-z0-9 ]", " ", t).split()
+                      if w not in _VOICE_STOP and not w.isdigit())
     return action, brightness, target
 
 
@@ -1341,8 +1345,29 @@ def _handle_voice_sync(payload: dict) -> dict:
         return {"ok": False, "error": "empty text"}
     action, brightness, target = _voice_parse(text)
     names = _voice_light_names()
+    all_entities = sorted(set(names.values()))
+
+    # ---- TIER 1a: GLOBAL command -> act on EVERY available light ----
+    # "turn off the lights", "lights 50%", "all lights off", "everything on" all leave
+    # target empty or an all-word. Act on the whole set, not a single fuzzy match.
+    is_global = (not target) or target in ("all", "everything", "every") \
+        or any(w in ("all", "everything", "every") for w in target.split())
+    if is_global and all_entities:
+        if action == "off":
+            status, _ = _ha_post("/services/light/turn_off", {"entity_id": all_entities})
+            speech = f"Turned off {len(all_entities)} lights."
+        else:
+            body = {"entity_id": all_entities}
+            if brightness is not None:
+                body["brightness_pct"] = brightness
+            status, _ = _ha_post("/services/light/turn_on", body)
+            speech = (f"Set {len(all_entities)} lights to {brightness} percent."
+                      if brightness is not None else f"Turned on {len(all_entities)} lights.")
+        return {"ok": 200 <= status < 300, "tier": "fast", "count": len(all_entities),
+                "entities": all_entities, "action": action, "brightness": brightness, "speech": speech}
+
     match = difflib.get_close_matches(target, list(names), n=1, cutoff=VOICE_CONFIDENCE)
-    if match:  # ---- TIER 1: fuzzy hit -> direct service call ----
+    if match:  # ---- TIER 1b: fuzzy hit on a specific device -> direct service call ----
         entity = names[match[0]]
         if action == "off":
             status, _ = _ha_post("/services/light/turn_off", {"entity_id": entity})
